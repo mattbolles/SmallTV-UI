@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local runtime and OS files
+server.log
+.DS_Store
+
+# Editor / tooling config
+.claude/
+
+# Local macOS launcher (hardcodes this machine's project path)
+SmallTV-UI.app/
