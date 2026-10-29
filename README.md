@@ -1,6 +1,6 @@
 # SmallTVUI
 
-A local web UI for the GeekMagic SmallTV-Ultra, a small ESP8266-based Wi-Fi display. It manages the files stored on the device and covers the settings on the device's own web page.
+A local web UI for the GeekMagic SmallTV-Ultra, a small ESP8266-based Wi-Fi display. It manages the files stored on the device, converts video clips into GIFs sized for its screen, and covers the settings on the device's own web page.
 
 ## How it works
 
@@ -18,6 +18,9 @@ The device sends no CORS headers, so a web page can't call it from another origi
 - Storage meter that turns red as the device fills up
 - Network, Weather, Time and Settings tabs mirroring the official page: Wi-Fi scan and credentials, startup delay, city, units, update interval, API keys, time zone, clock colors, 12/24-hour format, date format, colon blink, clock font, NTP server, themes and auto-switching, brightness, night mode, reboot, factory reset and firmware update
 - Each tab loads lazily, in a single browser request; the proxy then queries the device one endpoint at a time, since it can't cope with overlapping connections
+- Video to GIF: drop in a clip, trim it, zoom and drag it inside a square preview of the 240x240 screen (zooming out pads with black), then convert with ffmpeg and upload the result
+- Size controls for a device with very little free flash: frame rate, palette size (8 to 256 colors), dithering and an option that only re-encodes the parts of each frame that change
+- Shows the source video's resolution, length and frame rate
 
 ## Running
 
@@ -27,7 +30,7 @@ python3 server.py
 
 Then open <http://127.0.0.1:8765>, enter the device's IP address and press Connect (it's remembered in the browser), or change `DEFAULT_DEVICE` at the top of `server.py`.
 
-Python 3 is the only requirement (standard library only).
+Python 3 is the only requirement (standard library only), except that video conversion needs `ffmpeg` and `ffprobe` on your `PATH`, for example `brew install ffmpeg`.
 
 ## Device quirks worth knowing
 

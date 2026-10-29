@@ -4,7 +4,11 @@ generic file endpoints, so arbitrary files can be listed/uploaded/downloaded/
 deleted over WiFi without touching the device firmware.
 """
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,6 +18,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DEFAULT_DEVICE = "192.168.x.x"  # placeholder: your device's IP (or enter it in the page and press Connect)
 PORT = 8765
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".bmp")
+
+# The device's own UI recommends exactly these two square sizes: 240x240
+# for the Pictures/Photo Album slideshow (the screen's native resolution)
+# and 80x80 for the small weather-screen GIF. Anything else is stored but
+# never actually displayed as a picture, so the video-to-gif converter only
+# offers these rather than an arbitrary custom size.
+GIF_OUTPUT_SIZES = (240, 80)
+MAX_GIF_SECONDS = 10
+MIN_GIF_FPS, MAX_GIF_FPS = 2, 20
+MAX_VIDEO_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024  # 5GB — just a sanity cap, not a real limit
+# Palette size is the single biggest lever on GIF file size after
+# dimensions/fps/duration — a device with ~1MB of free flash cares about
+# this a lot more than a typical GIF viewer would.
+GIF_COLOR_CHOICES = (8, 16, 32, 64, 128, 256)
+GIF_DITHER_CHOICES = ("bayer", "floyd_steinberg", "none")
 
 ROW_RE = re.compile(
     r"<a href='([^']+)'>([^<]*)</a></td><td>(\d+)</td>", re.S
@@ -25,6 +44,128 @@ def device_request(device, path, method="GET", data=None, headers=None, timeout=
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status, dict(resp.getheaders()), resp.read()
+
+
+class FfmpegNotFound(Exception):
+    pass
+
+
+def probe_video_fps(video_bytes):
+    # The browser's own <video> element has no API for frame rate (only
+    # dimensions and duration), so this shells out to ffprobe instead. The
+    # caller only sends a few MB slice of the file rather than the whole
+    # thing — frame rate is declared in the stream's track headers, which
+    # for most real-world files (in particular anything exported with
+    # "faststart", which is the common case) sit near the front, so a
+    # small prefix is normally enough. If ffprobe can't find a video
+    # stream in that prefix this just returns None — silently skipping the
+    # fps display is preferable to re-uploading the entire file just for
+    # this one informational detail.
+    if shutil.which("ffprobe") is None:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "probe_input")
+        with open(in_path, "wb") as f:
+            f.write(video_bytes)
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0",
+            in_path,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            return None
+        if result.returncode != 0:
+            return None
+        out = result.stdout.decode("utf-8", "replace").strip()
+        try:
+            if "/" in out:
+                num, den = out.split("/", 1)
+                num, den = float(num), float(den)
+                return round(num / den, 2) if den else None
+            return round(float(out), 2)
+        except ValueError:
+            return None
+
+
+def convert_video_to_gif(
+    video_bytes, sw, sh, ox, oy, start, duration, fps, out_size,
+    colors=128, dither="bayer", optimize_static=True,
+):
+    # (sw, sh) is the size the source video should be scaled to, and (ox, oy)
+    # is where its top-left corner lands on the out_size x out_size output
+    # canvas — both already in output-canvas pixel units. Either can push
+    # the scaled video partly or fully outside the canvas in any direction
+    # (zoomed out small in the middle, zoomed in and cropped, panned off to
+    # one side, any combination), so this always pads first by exactly
+    # enough to make the final crop valid, then crops the canvas out of
+    # that padded frame. When the scaled video is >= out_size and centered,
+    # the padding amounts are all zero and this reduces to a plain crop —
+    # one code path covers both "shrink with letterboxing" and "crop to
+    # fill", which is the point of doing it this way instead of branching.
+    if shutil.which("ffmpeg") is None:
+        raise FfmpegNotFound()
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "input")
+        out_path = os.path.join(tmp, "output.gif")
+        with open(in_path, "wb") as f:
+            f.write(video_bytes)
+
+        # Shift both the video and the crop window right/down by just
+        # enough that neither has a negative coordinate, since ffmpeg's pad
+        # filter can only place its input at a non-negative offset. The
+        # crop window started at (0,0), so after shifting it sits at
+        # (shift_x, shift_y); the video (which started at ox,oy) sits at
+        # (max(ox,0), max(oy,0)). The padded canvas then has to be large
+        # enough to contain both the placed video and the placed crop
+        # window on each axis.
+        shift_x = max(0, -ox)
+        shift_y = max(0, -oy)
+        video_x = ox + shift_x
+        video_y = oy + shift_y
+        crop_x = shift_x
+        crop_y = shift_y
+        padded_w = max(video_x + sw, crop_x + out_size)
+        padded_h = max(video_y + sh, crop_y + out_size)
+
+        # `-ss` before `-i` is a fast container-level seek rather than a
+        # frame-accurate decode seek — much quicker on longer source
+        # videos, and plenty precise for a GIF clip. The palettegen/
+        # paletteuse two-pass filter chain gives far better color quality
+        # than ffmpeg's default GIF encoder, which matters a lot at these
+        # tiny 80-240px target sizes. `max_colors` is the main size/quality
+        # trade-off — a smaller palette compresses much better. diff_mode=
+        # rectangle (optional) makes paletteuse only re-encode the part of
+        # the frame that actually changed since the previous one, which is
+        # a substantial, effectively lossless size win for clips with any
+        # static background — very common for this use case.
+        paletteuse_opts = f"dither={dither}"
+        if optimize_static:
+            paletteuse_opts += ":diff_mode=rectangle"
+        vf = (
+            f"scale={sw}:{sh}:flags=lanczos,"
+            f"pad={padded_w}:{padded_h}:{video_x}:{video_y}:black,"
+            f"crop={out_size}:{out_size}:{crop_x}:{crop_y},"
+            f"fps={fps},"
+            f"split[a][b];[a]palettegen=stats_mode=diff:max_colors={colors}[p];"
+            f"[b][p]paletteuse={paletteuse_opts}"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start), "-t", str(duration),
+            "-i", in_path,
+            "-filter_complex", vf,
+            "-loop", "0",
+            out_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode, cmd, output=result.stdout, stderr=result.stderr
+            )
+        with open(out_path, "rb") as f:
+            return f.read()
 
 
 def build_multipart(field_name, filename, data):
@@ -314,16 +455,16 @@ INDEX_HTML = """<!doctype html>
   }
   .prog-bar-inner { height: 100%; width: 0%; background: var(--green-dark); transition: width 0.15s ease; }
   .load-error { color: var(--oxblood-dark); font-style: italic; font-size: 13px; }
-  #drop {
+  #drop, #v2gDrop {
     border: 2px dashed var(--line); border-radius: 2px; padding: 22px; text-align: center;
     color: var(--muted); font-style: italic; margin-top: 18px; cursor: pointer;
     background: rgba(255,253,247,0.5);
     transition: border-color 0.25s ease, background-color 0.25s ease, color 0.25s ease;
   }
-  #drop:hover {
+  #drop:hover, #v2gDrop:hover {
     border-color: var(--gold-dark); color: var(--gold-dark); background: rgba(163,129,63,0.1);
   }
-  #drop.over { border-color: var(--green-dark); color: var(--green-dark); background: rgba(47,74,60,0.07); }
+  #drop.over, #v2gDrop.over { border-color: var(--green-dark); color: var(--green-dark); background: rgba(47,74,60,0.07); }
   .hint { font-size: 12px; color: var(--muted); font-style: italic; margin: 8px 4px 0; line-height: 1.5; }
   #status { font-size: 13px; color: var(--muted); min-height: 18px; margin-top: 10px; font-style: italic; }
   #space { font-size: 13px; color: var(--muted); }
@@ -384,6 +525,38 @@ INDEX_HTML = """<!doctype html>
   .theme-checks { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; font-size: 14px; }
   .theme-checks label { display: flex; align-items: center; gap: 8px; }
   .warn { color: var(--oxblood-dark); }
+
+  /* --- Video-to-GIF converter ---
+     #v2gWrap is a fixed square "stage" representing the output canvas
+     directly (it's always square, since the device's screen is). The
+     video is positioned/sized inside it via absolute left/top/width/
+     height computed in JS from a zoom factor and a drag (pan) offset —
+     there's no separate crop-box element; overflow:hidden plus the black
+     background naturally show exactly what the final crop/pad will look
+     like, whether that's cropping into the video (zoom > 100%) or
+     shrinking it with letterboxing (zoom < 100%). */
+  #v2gWrap {
+    position: relative; width: min(320px, 100%); aspect-ratio: 1 / 1;
+    margin: 10px 0; overflow: hidden; background: #000; user-select: none;
+  }
+  #v2gVideo {
+    position: absolute; background: #000;
+    /* The drag overlay (not the video) handles panning — its own Play/
+       Seek controls live outside the stage — so the video itself never
+       needs to receive pointer events. Without this, native browser
+       hit-testing on the video element (which differs across Chrome,
+       Firefox and Safari) could swallow drags meant for the overlay. */
+    pointer-events: none;
+    -webkit-user-drag: none;
+  }
+  #v2gDragOverlay {
+    position: absolute; inset: 0; cursor: move; touch-action: none;
+  }
+  #v2gResultImg {
+    display: block; max-width: 240px; margin: 10px 0;
+    border: 1px solid var(--line); background: #fff;
+    image-rendering: pixelated;
+  }
 </style>
 </head>
 <body>
@@ -422,6 +595,86 @@ INDEX_HTML = """<!doctype html>
     <div id="drop">Drag files here to upload, or click to choose</div>
     <input type="file" id="fileInput" multiple style="display:none">
     <p class="hint">The device's screen measures 240&times;240px &mdash; JPG and GIF images at that size display natively in its slideshow; other sizes are stored as-is, unscaled. Other file types may be uploaded and stored too, but won't appear as pictures. Upload size is limited only by the free space shown above.</p>
+
+    <h2 class="section-title">Convert Video to GIF</h2>
+    <p class="hint">Upload a short video, crop and trim it, and convert it to a GIF sized for the display. Runs locally through ffmpeg &mdash; nothing leaves this machine until you choose to upload the result.</p>
+    <div id="v2gDrop">Drag a video here to convert, or click to choose</div>
+    <input type="file" id="v2gFile" accept="video/*" style="display:none">
+    <div id="v2gLoadStatus" class="hint" style="min-height:16px"></div>
+    <div id="v2gEditor" style="display:none">
+      <div id="v2gWrap">
+        <video id="v2gVideo" muted playsinline preload="metadata"></video>
+        <div id="v2gDragOverlay"></div>
+      </div>
+      <p id="v2gMeta" class="hint"></p>
+      <div class="field-row">
+        <button type="button" id="v2gPlayBtn">Play</button>
+        <input type="range" id="v2gSeek" min="0" max="1000" value="0" style="flex:1;min-width:140px">
+        <span id="v2gTimeLabel" class="hint" style="margin:0">0:00 / 0:00</span>
+      </div>
+      <div class="field-row">
+        <label>Zoom</label>
+        <input type="range" id="v2gZoomSlider" min="20" max="300" value="100" style="width:160px">
+        <span class="hint" style="margin:0">drag the video to reposition &mdash; below 100% adds black padding</span>
+      </div>
+      <div class="field-row">
+        <label>Start</label>
+        <input type="text" id="v2gStart" style="width:55px" value="0">s
+        <button type="button" id="v2gStartNow">Use current</button>
+        <label>End</label>
+        <input type="text" id="v2gEnd" style="width:55px">s
+        <button type="button" id="v2gEndNow">Use current</button>
+        <span class="hint" style="margin:0">10s clip limit</span>
+      </div>
+      <div class="field-row">
+        <label>Frame Rate</label>
+        <input type="text" id="v2gFps" style="width:45px" value="10">fps
+        <label>Output Size</label>
+        <select id="v2gSize">
+          <option value="240">240&times;240 (Pictures)</option>
+          <option value="80">80&times;80 (Weather GIF)</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <label>Colors</label>
+        <select id="v2gColors">
+          <option value="256">256 (largest, best quality)</option>
+          <option value="128" selected>128</option>
+          <option value="64">64</option>
+          <option value="32">32</option>
+          <option value="16">16</option>
+          <option value="8">8 (smallest, roughest)</option>
+        </select>
+        <label>Dither</label>
+        <select id="v2gDither">
+          <option value="bayer" selected>Bayer (smoother gradients)</option>
+          <option value="floyd_steinberg">Floyd&ndash;Steinberg</option>
+          <option value="none">None (smaller, can band)</option>
+        </select>
+      </div>
+      <div class="field-row">
+        <label><input type="checkbox" id="v2gOptimizeStatic" checked> Optimize static areas</label>
+        <span class="hint" style="margin:0">shrinks clips with a mostly-still background &mdash; no quality cost</span>
+      </div>
+      <div class="field-row">
+        <button id="v2gConvertBtn" class="primary">Convert to GIF</button>
+        <span id="v2gConvertStatus" class="hint" style="margin:0"></span>
+      </div>
+      <div id="v2gResult" style="display:none">
+        <img id="v2gResultImg" alt="Converted GIF preview">
+        <p id="v2gResultInfo" class="hint"></p>
+        <div class="field-row">
+          <label>Filename</label>
+          <input type="text" id="v2gFilename" style="width:160px">
+          <label>Folder</label>
+          <select id="v2gUploadDir">
+            <option value="/image/">Pictures</option>
+            <option value="/gif/">Weather GIF</option>
+          </select>
+          <button id="v2gUploadBtn" class="primary">Upload to Device</button>
+        </div>
+      </div>
+    </div>
 
     <div id="status"></div>
     <table id="tbl">
@@ -874,6 +1127,241 @@ $('drop').addEventListener('drop', e => {
   $('drop').classList.remove('over');
   upload(e.dataTransfer.files);
 });
+
+// --- Video-to-GIF converter ---------------------------------------------
+// #v2gWrap is a fixed square "stage" that IS the output canvas: instead of
+// dragging a crop box around a fixed video, the video itself is positioned
+// and scaled inside a fixed square viewport (like a profile-photo
+// cropper). At zoom=100% the video's shorter side exactly fills the
+// stage (the old default "crop to fill" look); above 100% it's zoomed in
+// and cropped; below 100% it's smaller than the stage, and the stage's
+// black background shows through as padding — one continuous control
+// handles both without a separate mode switch.
+const v2gVideo = $('v2gVideo');
+const v2gWrap = $('v2gWrap');
+const v2gDragOverlay = $('v2gDragOverlay');
+let v2gFile = null;
+let v2gDragState = null;
+let v2gResultBlob = null;
+let v2gZoom = 1;
+let v2gPanX = 0;
+let v2gPanY = 0;
+
+function v2gFormatTime(t) {
+  if (!isFinite(t) || t < 0) return '0:00';
+  const m = Math.floor(t / 60);
+  const s = Math.floor(t % 60).toString().padStart(2, '0');
+  return m + ':' + s;
+}
+
+function v2gHandleFile(f) {
+  if (!f) return;
+  v2gFile = f;
+  $('v2gEditor').style.display = 'none';
+  $('v2gResult').style.display = 'none';
+  $('v2gLoadStatus').textContent = 'Loading video…';
+  $('v2gLoadStatus').style.color = '';
+  // Revoke the previous file's object URL, if any, so switching files
+  // repeatedly doesn't leak memory.
+  if (v2gVideo.dataset.blobUrl) URL.revokeObjectURL(v2gVideo.dataset.blobUrl);
+  const url = URL.createObjectURL(f);
+  v2gVideo.dataset.blobUrl = url;
+  v2gVideo.src = url;
+  v2gVideo.load();
+}
+$('v2gFile').onchange = (e) => v2gHandleFile(e.target.files[0]);
+$('v2gDrop').onclick = () => $('v2gFile').click();
+$('v2gDrop').addEventListener('dragover', e => { e.preventDefault(); $('v2gDrop').classList.add('over'); });
+$('v2gDrop').addEventListener('dragleave', () => $('v2gDrop').classList.remove('over'));
+$('v2gDrop').addEventListener('drop', e => {
+  e.preventDefault();
+  $('v2gDrop').classList.remove('over');
+  v2gHandleFile(e.dataTransfer.files[0]);
+});
+
+let v2gProbeToken = 0;
+
+v2gVideo.addEventListener('loadedmetadata', () => {
+  $('v2gLoadStatus').textContent = '';
+  $('v2gEditor').style.display = 'block';
+  $('v2gMeta').textContent = v2gVideo.videoWidth + '×' + v2gVideo.videoHeight +
+    ' · ' + v2gFormatTime(v2gVideo.duration) + ' long';
+  $('v2gTimeLabel').textContent = '0:00 / ' + v2gFormatTime(v2gVideo.duration);
+  $('v2gStart').value = '0';
+  $('v2gEnd').value = Math.min(5, v2gVideo.duration).toFixed(1);
+  v2gZoom = 1;
+  v2gPanX = 0;
+  v2gPanY = 0;
+  $('v2gZoomSlider').value = 100;
+  // The stage has just become visible and needs a layout pass before its
+  // rendered size can be measured correctly.
+  requestAnimationFrame(v2gLayoutVideo);
+  $('v2gEditor').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  v2gProbeFps(v2gFile, ++v2gProbeToken);
+});
+
+async function v2gProbeFps(file, token) {
+  // The browser has no API for a video's frame rate, so this asks the
+  // server to run ffprobe on just a small slice of the file (see
+  // probe_video_fps in server.py) rather than uploading the whole thing.
+  // `token` guards against a slow probe for a previously-picked file
+  // overwriting the meta line after the user has already moved on to a
+  // different one.
+  try {
+    const prefix = file.slice(0, 4 * 1024 * 1024);
+    const res = await fetch('/api/video-probe', { method: 'POST', body: prefix });
+    const j = await res.json();
+    if (j.fps && token === v2gProbeToken) {
+      $('v2gMeta').textContent += ' · ' + j.fps + ' fps';
+    }
+  } catch (e) {
+    // Not critical enough to surface an error for — the fps just won't show.
+  }
+}
+
+v2gVideo.addEventListener('error', () => {
+  $('v2gLoadStatus').textContent = "Couldn't load that video — the format may not be supported by this browser.";
+  $('v2gLoadStatus').style.color = '#7d3644';
+});
+
+// Custom playback controls, entirely outside the stage — see the
+// #v2gVideo CSS comment for why the video itself is pointer-events:none.
+$('v2gPlayBtn').onclick = () => {
+  if (v2gVideo.paused) v2gVideo.play(); else v2gVideo.pause();
+};
+v2gVideo.addEventListener('play', () => { $('v2gPlayBtn').textContent = 'Pause'; });
+v2gVideo.addEventListener('pause', () => { $('v2gPlayBtn').textContent = 'Play'; });
+let v2gSeeking = false;
+v2gVideo.addEventListener('timeupdate', () => {
+  if (!v2gSeeking && v2gVideo.duration) {
+    $('v2gSeek').value = (v2gVideo.currentTime / v2gVideo.duration) * 1000;
+  }
+  $('v2gTimeLabel').textContent = v2gFormatTime(v2gVideo.currentTime) + ' / ' + v2gFormatTime(v2gVideo.duration);
+});
+$('v2gSeek').addEventListener('input', () => {
+  if (!v2gVideo.duration) return;
+  v2gSeeking = true;
+  v2gVideo.currentTime = ($('v2gSeek').value / 1000) * v2gVideo.duration;
+});
+$('v2gSeek').addEventListener('change', () => { v2gSeeking = false; });
+
+// Positions/sizes the video inside the square stage from (v2gZoom,
+// v2gPanX, v2gPanY). At zoom=1 the video's shorter side equals the
+// stage's side length, centered; v2gPanX/Y are then a plain pixel offset
+// from that centered position.
+function v2gLayoutVideo() {
+  const stageSize = v2gWrap.clientWidth;
+  if (!stageSize || !v2gVideo.videoWidth) return;
+  const aspect = v2gVideo.videoWidth / v2gVideo.videoHeight;
+  let baseW, baseH;
+  if (aspect >= 1) { baseH = stageSize; baseW = stageSize * aspect; }
+  else { baseW = stageSize; baseH = stageSize / aspect; }
+  const w = baseW * v2gZoom;
+  const h = baseH * v2gZoom;
+  v2gVideo.style.left = ((stageSize - w) / 2 + v2gPanX) + 'px';
+  v2gVideo.style.top = ((stageSize - h) / 2 + v2gPanY) + 'px';
+  v2gVideo.style.width = w + 'px';
+  v2gVideo.style.height = h + 'px';
+}
+
+$('v2gZoomSlider').addEventListener('input', () => {
+  v2gZoom = $('v2gZoomSlider').value / 100;
+  v2gLayoutVideo();
+});
+
+// Pointer Events (not mouse events) with explicit capture: once
+// setPointerCapture is called, the browser guarantees every subsequent
+// move/up for this pointer routes to the overlay directly, even if the
+// cursor leaves its bounds mid-drag or moves faster than layout can
+// track. Plain mousemove/mouseup on document is the classic pattern but
+// is more prone to "losing" a fast drag, and pointer capture is the more
+// robust modern fix for that — it's also what fixed dragging being
+// unreliable in Safari with plain mouse events.
+v2gDragOverlay.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  v2gDragOverlay.setPointerCapture(e.pointerId);
+  v2gDragState = { startX: e.clientX, startY: e.clientY, panX: v2gPanX, panY: v2gPanY };
+});
+v2gDragOverlay.addEventListener('pointermove', (e) => {
+  if (!v2gDragState) return;
+  v2gPanX = v2gDragState.panX + (e.clientX - v2gDragState.startX);
+  v2gPanY = v2gDragState.panY + (e.clientY - v2gDragState.startY);
+  v2gLayoutVideo();
+});
+v2gDragOverlay.addEventListener('pointerup', (e) => {
+  v2gDragState = null;
+  v2gDragOverlay.releasePointerCapture(e.pointerId);
+});
+
+$('v2gStartNow').onclick = () => { $('v2gStart').value = v2gVideo.currentTime.toFixed(1); };
+$('v2gEndNow').onclick = () => { $('v2gEnd').value = v2gVideo.currentTime.toFixed(1); };
+
+$('v2gConvertBtn').onclick = async () => {
+  if (!v2gFile) return;
+  const start = parseFloat($('v2gStart').value) || 0;
+  const end = parseFloat($('v2gEnd').value) || 0;
+  const duration = end - start;
+  if (duration <= 0) { toast('End time must be after start time.', false); return; }
+  if (duration > 10) { toast('Clips are limited to 10 seconds.', false); return; }
+
+  // Converts the stage's CSS-pixel layout into output-canvas pixel units
+  // by the single ratio outSize/stageSize — the stage IS the canvas, just
+  // at a different pixel density, so this is a straight rescale of
+  // whatever v2gLayoutVideo already computed for width/height/left/top.
+  const outSize = parseInt($('v2gSize').value, 10);
+  const stageSize = v2gWrap.clientWidth;
+  const ratio = outSize / stageSize;
+  const sw = Math.round((parseFloat(v2gVideo.style.width) || 0) * ratio);
+  const sh = Math.round((parseFloat(v2gVideo.style.height) || 0) * ratio);
+  const ox = Math.round((parseFloat(v2gVideo.style.left) || 0) * ratio);
+  const oy = Math.round((parseFloat(v2gVideo.style.top) || 0) * ratio);
+
+  $('v2gConvertBtn').disabled = true;
+  $('v2gConvertStatus').textContent = 'Converting… this can take a while depending on video length and size.';
+  $('v2gResult').style.display = 'none';
+  try {
+    const device = $('device').value.trim();
+    const params = new URLSearchParams({
+      sw, sh, ox, oy, start, duration,
+      fps: $('v2gFps').value, size: outSize, device,
+      colors: $('v2gColors').value, dither: $('v2gDither').value,
+      optimize: $('v2gOptimizeStatic').checked ? '1' : '0',
+    });
+    const res = await fetch('/api/video-to-gif?' + params.toString(), { method: 'POST', body: v2gFile });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.error || ('HTTP ' + res.status));
+    }
+    const blob = await res.blob();
+    v2gResultBlob = blob;
+    $('v2gResultImg').src = URL.createObjectURL(blob);
+    $('v2gResultInfo').textContent = 'Result: ' + Math.round(blob.size / 1024) + 'KB';
+    $('v2gFilename').value = (v2gFile.name || 'clip').replace(/\\.[^.]+$/, '') + '.gif';
+    $('v2gUploadDir').value = $('v2gSize').value === '80' ? '/gif/' : '/image/';
+    $('v2gResult').style.display = 'block';
+  } catch (e) {
+    toast('Conversion failed: ' + e.message, false);
+  }
+  $('v2gConvertStatus').textContent = '';
+  $('v2gConvertBtn').disabled = false;
+};
+
+$('v2gUploadBtn').onclick = async () => {
+  if (!v2gResultBlob) return;
+  const name = $('v2gFilename').value.trim() || 'clip.gif';
+  const dir = $('v2gUploadDir').value;
+  $('v2gUploadBtn').disabled = true;
+  try {
+    const fd = new FormData();
+    fd.append('image', v2gResultBlob, name);
+    await api('/api/upload?dir=' + encodeURIComponent(dir), { method: 'POST', body: fd });
+    toast('Uploaded ' + name + ' to ' + dir, true);
+    if (curDir === dir) list(dir);
+  } catch (e) {
+    toast('Upload failed: ' + e.message, false);
+  }
+  $('v2gUploadBtn').disabled = false;
+};
 
 // --- Tabs: Network / Weather / Time / Settings -------------------------
 // Each tab's fields are only fetched the first time that tab is opened
@@ -1348,6 +1836,74 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_bytes(resp_body, status=status)
             except Exception as e:
                 self._send_json({"error": str(e)}, status=502)
+            return
+
+        if parsed.path == "/api/video-probe":
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0 or length > MAX_VIDEO_UPLOAD_BYTES:
+                self._send_json({"fps": None})
+                return
+            video_bytes = self.rfile.read(length)
+            self._send_json({"fps": probe_video_fps(video_bytes)})
+            return
+
+        if parsed.path == "/api/video-to-gif":
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0:
+                self._send_json({"error": "No video data received."}, status=400)
+                return
+            if length > MAX_VIDEO_UPLOAD_BYTES:
+                self._send_json({"error": "Video file too large (5GB limit)."}, status=400)
+                return
+            video_bytes = self.rfile.read(length)
+            try:
+                # sw/sh: size the source video is scaled to. ox/oy: where its
+                # top-left corner lands on the out_size square canvas. All
+                # four are in output-canvas pixel units and ox/oy may be
+                # negative — see convert_video_to_gif for how that's handled.
+                sw = int(qs.get("sw", ["0"])[0])
+                sh = int(qs.get("sh", ["0"])[0])
+                ox = int(qs.get("ox", ["0"])[0])
+                oy = int(qs.get("oy", ["0"])[0])
+                start = max(0.0, float(qs.get("start", ["0"])[0]))
+                duration = float(qs.get("duration", ["3"])[0])
+                fps = int(qs.get("fps", ["10"])[0])
+                out_size = int(qs.get("size", ["240"])[0])
+                colors = int(qs.get("colors", ["128"])[0])
+                dither = qs.get("dither", ["bayer"])[0]
+                optimize_static = qs.get("optimize", ["1"])[0] == "1"
+            except (ValueError, TypeError):
+                self._send_json({"error": "Invalid parameters."}, status=400)
+                return
+            if sw <= 0 or sh <= 0 or sw > 4000 or sh > 4000:
+                self._send_json({"error": "Invalid scaled video size."}, status=400)
+                return
+            duration = max(0.2, min(duration, MAX_GIF_SECONDS))
+            fps = max(MIN_GIF_FPS, min(fps, MAX_GIF_FPS))
+            if out_size not in GIF_OUTPUT_SIZES:
+                out_size = 240
+            if colors not in GIF_COLOR_CHOICES:
+                colors = 128
+            if dither not in GIF_DITHER_CHOICES:
+                dither = "bayer"
+            try:
+                gif_bytes = convert_video_to_gif(
+                    video_bytes, sw, sh, ox, oy, start, duration, fps, out_size,
+                    colors=colors, dither=dither, optimize_static=optimize_static,
+                )
+            except FfmpegNotFound:
+                self._send_json(
+                    {"error": "ffmpeg is not installed on this machine."}, status=500
+                )
+            except subprocess.TimeoutExpired:
+                self._send_json({"error": "Conversion timed out."}, status=500)
+            except subprocess.CalledProcessError as e:
+                stderr = (e.stderr or b"").decode("utf-8", "replace")[-800:]
+                self._send_json({"error": f"ffmpeg failed: {stderr}"}, status=500)
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=500)
+            else:
+                self._send_bytes(gif_bytes, content_type="image/gif")
             return
 
         if parsed.path == "/api/rename":
