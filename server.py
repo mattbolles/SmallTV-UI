@@ -44,6 +44,75 @@ def build_multipart(field_name, filename, data):
     return pre + data + post, f"multipart/form-data; boundary={boundary}"
 
 
+def fetch_json(device, path):
+    # The device 404s for any setting that hasn't been explicitly saved yet
+    # (rather than returning a default), so this just returns None in that
+    # case — callers treat a missing key the same way the official UI does:
+    # leave the field at its HTML default.
+    try:
+        _, _, body = device_request(device, path)
+        return json.loads(body)
+    except Exception:
+        return None
+
+
+# --- Per-tab batched loaders -------------------------------------------
+# Each of these fetches several small device JSON endpoints SEQUENTIALLY
+# (the device can't handle concurrent connections — see annotate_resolutions
+# below) and merges them into one dict. They're intentionally written out
+# individually rather than driven by a generic {tab: [endpoints]} table,
+# so that opening a tab costs exactly one browser -> proxy round trip no
+# matter how many device endpoints back it, and so each tab only ever
+# fetches the handful of endpoints it actually renders (never more, and
+# nothing until the tab is actually opened). This is the same
+# "verbose beats clever" trade discussed for annotate_resolutions.
+
+def load_network_tab(device):
+    return {
+        "config": fetch_json(device, "/config.json"),
+        "delay": fetch_json(device, "/delay.json"),
+    }
+
+
+def load_weather_tab(device):
+    return {
+        "city": fetch_json(device, "/city.json"),
+        "unit": fetch_json(device, "/unit.json"),
+        "w_i": fetch_json(device, "/w_i.json"),
+        "key": fetch_json(device, "/key.json"),
+    }
+
+
+def load_time_tab(device):
+    return {
+        "tz": fetch_json(device, "/tz.json"),
+        "timecolor": fetch_json(device, "/timecolor.json"),
+        "hour12": fetch_json(device, "/hour12.json"),
+        "day": fetch_json(device, "/day.json"),
+        "colon": fetch_json(device, "/colon.json"),
+        "font": fetch_json(device, "/font.json"),
+        "ntp": fetch_json(device, "/ntp.json"),
+    }
+
+
+def load_settings_tab(device):
+    return {
+        "v": fetch_json(device, "/v.json"),
+        "brt": fetch_json(device, "/brt.json"),
+        "app": fetch_json(device, "/app.json"),
+        "timebrt": fetch_json(device, "/timebrt.json"),
+        "theme_list": fetch_json(device, "/theme_list.json"),
+    }
+
+
+TAB_LOADERS = {
+    "network": load_network_tab,
+    "weather": load_weather_tab,
+    "time": load_time_tab,
+    "settings": load_settings_tab,
+}
+
+
 def parse_filelist(html):
     files = []
     for href, name, size in ROW_RE.findall(html):
@@ -201,12 +270,12 @@ INDEX_HTML = """<!doctype html>
     100% { background-position: -50% 0; }
   }
   .bar { display: flex; gap: 10px; margin-bottom: 14px; align-items: center; flex-wrap: wrap; font-size: 14px; }
-  input[type=text], select {
+  input[type=text] {
     font-family: inherit; font-size: 14px; padding: 6px 9px;
     border: 1px solid var(--line); border-radius: 2px;
     background: #fffdf7; color: var(--ink);
   }
-  input[type=text]:focus, select:focus { outline: 1px solid var(--gold-dark); }
+  input[type=text]:focus { outline: 1px solid var(--gold-dark); }
   button {
     font-family: inherit; font-size: 13px; padding: 7px 14px;
     border: 1px solid var(--gold-dark); border-radius: 2px;
@@ -269,12 +338,52 @@ INDEX_HTML = """<!doctype html>
   }
   a.dl { color: var(--green-dark); text-decoration: underline; }
   a.dl:hover { color: var(--oxblood-dark); }
+  a.jump-link { color: var(--green-dark); font-style: normal; }
+  a.jump-link:hover { color: var(--oxblood-dark); }
   .colophon { text-align: center; margin-top: 22px; }
   .colophon a {
     font-size: 12px; color: var(--muted); text-decoration: none;
     letter-spacing: 0.04em; border-bottom: 1px solid transparent;
   }
   .colophon a:hover { color: var(--gold-dark); border-bottom-color: var(--gold-dark); }
+
+  /* --- Tabs --- */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 4px 0 22px; flex-wrap: wrap; }
+  .tab-btn {
+    background: none; border: 1px solid transparent; border-bottom: none;
+    border-radius: 3px 3px 0 0; padding: 8px 16px; font-family: inherit; font-size: 12px;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); cursor: pointer;
+    box-shadow: none; position: relative; top: 1px;
+  }
+  .tab-btn:hover { color: var(--green-dark); background: rgba(163,129,63,0.08); }
+  .tab-btn.active { color: var(--green-dark); background: var(--panel); border-color: var(--line); border-bottom: 1px solid var(--panel); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* --- Save toast --- */
+  .toast { min-height: 18px; text-align: center; font-size: 13px; font-style: italic; margin-bottom: 8px; opacity: 0; transition: opacity 0.3s ease; }
+  .toast.show { opacity: 1; }
+
+  /* --- Form sections shared by Network / Weather / Time / Settings tabs --- */
+  .section-title { font-size: 15px; color: var(--green-dark); font-weight: normal; letter-spacing: 0.03em; margin: 26px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  .section-title:first-child { margin-top: 0; }
+  .field-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; font-size: 14px; }
+  .field-row label { color: var(--muted); }
+  input[type=text], input[type=password], select {
+    font-family: inherit; font-size: 14px; padding: 6px 9px;
+    border: 1px solid var(--line); border-radius: 2px;
+    background: #fffdf7; color: var(--ink);
+  }
+  input[type=password]:focus, select:focus { outline: 1px solid var(--gold-dark); }
+  input[type=color] { width: 44px; height: 30px; padding: 2px; border: 1px solid var(--line); border-radius: 2px; background: #fffdf7; cursor: pointer; }
+  input[type=range] { accent-color: var(--green-dark); vertical-align: middle; }
+  input[type=checkbox] { accent-color: var(--green-dark); width: 15px; height: 15px; vertical-align: middle; }
+  input[type=file] { font-family: inherit; font-size: 13px; }
+  .theme-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+  .theme-buttons button.active-theme { background: linear-gradient(#4a6d5b, var(--green-dark)); color: #f2e8d3; border-color: var(--green-dark); }
+  .theme-checks { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; font-size: 14px; }
+  .theme-checks label { display: flex; align-items: center; gap: 8px; }
+  .warn { color: var(--oxblood-dark); }
 </style>
 </head>
 <body>
@@ -283,6 +392,8 @@ INDEX_HTML = """<!doctype html>
     <h1>SmallTVUI</h1>
   </header>
 
+  <div id="toast" class="toast"></div>
+
   <div class="bar">
     Device IP: <input type="text" id="device" style="width:130px">
     <button id="connectBtn" class="primary">Connect</button>
@@ -290,24 +401,223 @@ INDEX_HTML = """<!doctype html>
     <span id="space" class="hint" style="margin:0"></span>
   </div>
 
-  <div class="bar">
-    <label for="folderPreset">Folder</label>
-    <select id="folderPreset" style="width:180px">
-      <option value="/image/">Pictures</option>
-      <option value="/gif/">Weather GIF</option>
-    </select>
-    <button id="refreshBtn">Refresh</button>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="pictures">Pictures</button>
+    <button class="tab-btn" data-tab="network">Network</button>
+    <button class="tab-btn" data-tab="weather">Weather</button>
+    <button class="tab-btn" data-tab="time">Time</button>
+    <button class="tab-btn" data-tab="settings">Settings</button>
+  </nav>
+
+  <div id="tab-pictures" class="tab-panel active">
+    <div class="bar">
+      <label for="folderPreset">Folder</label>
+      <select id="folderPreset" style="width:180px">
+        <option value="/image/">Pictures</option>
+        <option value="/gif/">Weather GIF</option>
+      </select>
+      <button id="refreshBtn">Refresh</button>
+    </div>
+
+    <div id="drop">Drag files here to upload, or click to choose</div>
+    <input type="file" id="fileInput" multiple style="display:none">
+    <p class="hint">The device's screen measures 240&times;240px &mdash; JPG and GIF images at that size display natively in its slideshow; other sizes are stored as-is, unscaled. Other file types may be uploaded and stored too, but won't appear as pictures. Upload size is limited only by the free space shown above.</p>
+
+    <div id="status"></div>
+    <table id="tbl">
+      <thead><tr><th>Name</th><th>Resolution</th><th>Size (KB)</th><th></th><th></th><th></th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
   </div>
 
-  <div id="drop">Drag files here to upload, or click to choose</div>
-  <input type="file" id="fileInput" multiple style="display:none">
-  <p class="hint">The device's screen measures 240&times;240px &mdash; JPG and GIF images at that size display natively in its slideshow; other sizes are stored as-is, unscaled. Other file types may be uploaded and stored too, but won't appear as pictures. Upload size is limited only by the free space shown above.</p>
+  <div id="tab-network" class="tab-panel">
+    <h2 class="section-title">Wi-Fi</h2>
+    <div class="field-row">
+      <select id="wifiSelect" style="flex:1;min-width:200px"><option value="">Scanning&hellip;</option></select>
+      <button id="wifiRescanBtn">Rescan</button>
+    </div>
+    <p class="hint">Select a network with a strong signal &mdash; 2.4GHz only, 5GHz is not supported.</p>
+    <div class="field-row">
+      <label for="wifiSsid" style="min-width:120px">Wi-Fi Name</label>
+      <input type="text" id="wifiSsid" style="width:240px">
+    </div>
+    <div class="field-row">
+      <label for="wifiPwd" style="min-width:120px">Wi-Fi Password</label>
+      <input type="password" id="wifiPwd" style="width:240px">
+    </div>
+    <div class="field-row">
+      <button id="wifiSaveBtn" class="primary">Save</button>
+    </div>
+    <p class="hint">The password field is always left blank here &mdash; re-enter it whenever you change networks. After saving, the device's own &ldquo;GIFTV&rdquo; hotspot turns off and it takes a new address on your network.</p>
 
-  <div id="status"></div>
-  <table id="tbl">
-    <thead><tr><th>Name</th><th>Resolution</th><th>Size (KB)</th><th></th><th></th><th></th><th></th></tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
+    <h2 class="section-title">Startup Delay</h2>
+    <p class="hint">How long to wait after power-on before connecting to Wi-Fi &mdash; useful if your router boots slower than the device.</p>
+    <div class="field-row">
+      <input type="text" id="wifiDelay" style="width:70px" placeholder="0"> seconds
+      <button id="wifiDelaySaveBtn">Save</button>
+    </div>
+  </div>
+
+  <div id="tab-weather" class="tab-panel">
+    <h2 class="section-title">City Location</h2>
+    <p class="hint">A city name, "City,Country", or a numeric city ID from openweathermap.org.</p>
+    <div class="field-row">
+      <input type="text" id="weatherCity" placeholder="Seoul" style="width:240px">
+      <button id="weatherCitySaveBtn" class="primary">Save</button>
+    </div>
+
+    <h2 class="section-title">Units</h2>
+    <div class="field-row">
+      <label>Wind Speed</label>
+      <select id="weatherWindUnit"><option>m/s</option><option>km/h</option><option>mile/h</option></select>
+      <label>Temperature</label>
+      <select id="weatherTempUnit"><option>&deg;C</option><option>&deg;F</option></select>
+      <label>Pressure</label>
+      <select id="weatherPressureUnit"><option>hPa</option><option>kPa</option><option>mmHg</option><option>inHg</option></select>
+      <button id="weatherUnitSaveBtn">Save</button>
+    </div>
+
+    <h2 class="section-title">Update Interval</h2>
+    <p class="hint">20 minutes by default &mdash; a higher rate is possible once you set your own API key below.</p>
+    <div class="field-row">
+      <input type="text" id="weatherInterval" style="width:60px" placeholder="20"> minutes
+      <button id="weatherIntervalSaveBtn">Save</button>
+    </div>
+
+    <h2 class="section-title">API Keys</h2>
+    <p class="hint">Optional &mdash; a personal key from openweathermap.org gives a higher, more stable update rate than the shared public key.</p>
+    <div class="field-row">
+      <label style="min-width:110px">Weather Key</label>
+      <input type="text" id="weatherKey" placeholder="xxxxxxxxxx" style="width:200px">
+      <button id="weatherKeySaveBtn">Save</button>
+    </div>
+    <div class="field-row">
+      <label style="min-width:110px">Forecast Key</label>
+      <input type="text" id="weatherForecastKey" placeholder="xxxxxxxxxx" style="width:200px">
+      <button id="weatherForecastKeySaveBtn">Save</button>
+    </div>
+
+    <h2 class="section-title">Weather-Screen GIF</h2>
+    <p class="hint">80&times;80px. <a href="#" id="gotoGifFolder" class="jump-link">Manage it in Pictures &rarr;</a></p>
+  </div>
+
+  <div id="tab-time" class="tab-panel">
+    <h2 class="section-title">Time Zone</h2>
+    <div class="field-row">
+      <label>Mode</label>
+      <select id="tzMode"><option value="1">Auto (from city)</option><option value="0">Manual</option></select>
+      <label>UTC Offset</label>
+      <select id="tzOffset"></select>
+      <button id="tzSaveBtn" class="primary">Save</button>
+    </div>
+
+    <h2 class="section-title">Clock Colors</h2>
+    <div class="field-row">
+      <label>Hour</label><input type="color" id="timeHourColor" value="#ffffff">
+      <label>Minute</label><input type="color" id="timeMinColor" value="#feba01">
+      <label>Second</label><input type="color" id="timeSecColor" value="#ffffff">
+      <button id="timeColorSaveBtn">Save</button>
+    </div>
+
+    <h2 class="section-title">Format</h2>
+    <div class="field-row">
+      <label><input type="checkbox" id="time12h"> 12-hour clock</label>
+      <button id="time12hSaveBtn">Save</button>
+    </div>
+    <div class="field-row">
+      <label for="dateFormat">Date Format</label>
+      <select id="dateFormat">
+        <option value="1">DD/MM/YYYY</option>
+        <option value="2">YYYY/MM/DD</option>
+        <option value="3">MM/DD/YYYY</option>
+        <option value="4">MM/DD</option>
+        <option value="5">DD/MM</option>
+      </select>
+      <span class="hint" style="margin:0">saves immediately</span>
+    </div>
+    <div class="field-row">
+      <label><input type="checkbox" id="colonBlink"> Blink colon</label>
+      <button id="colonSaveBtn">Save</button>
+    </div>
+    <div class="field-row">
+      <label for="timeFont">Style Font</label>
+      <select id="timeFont"><option value="1">Default Big Font</option><option value="2">Digital Font</option></select>
+      <span class="hint" style="margin:0">saves immediately</span>
+    </div>
+
+    <h2 class="section-title">NTP Server</h2>
+    <div class="field-row">
+      <input type="text" id="ntpServer" placeholder="pool.ntp.org" style="width:220px">
+      <button id="ntpSaveBtn">Save</button>
+    </div>
+  </div>
+
+  <div id="tab-settings" class="tab-panel">
+    <h2 class="section-title">Theme</h2>
+    <p class="hint">Disable auto-switching below if you want to pick a theme manually.</p>
+    <div class="theme-buttons">
+      <button data-theme="1">Weather Clock Today</button>
+      <button data-theme="2">Weather Forecast</button>
+      <button data-theme="3">Photo Album</button>
+      <button data-theme="4">Time Style 1</button>
+      <button data-theme="5">Time Style 2</button>
+      <button data-theme="6">Time Style 3</button>
+      <button data-theme="7">Simple Weather Clock</button>
+    </div>
+
+    <h2 class="section-title">Auto Switch Themes</h2>
+    <div class="theme-checks">
+      <label><input type="checkbox" class="theme-check" value="1"> Weather Clock Today</label>
+      <label><input type="checkbox" class="theme-check" value="2"> Weather Forecast</label>
+      <label><input type="checkbox" class="theme-check" value="3"> Photo Album</label>
+      <label><input type="checkbox" class="theme-check" value="4"> Time Style 1</label>
+      <label><input type="checkbox" class="theme-check" value="5"> Time Style 2</label>
+      <label><input type="checkbox" class="theme-check" value="6"> Time Style 3</label>
+      <label><input type="checkbox" class="theme-check" value="7"> Simple Weather Clock</label>
+    </div>
+    <div class="field-row">
+      <label><input type="checkbox" id="themeAutoEn"> Enable</label>
+      <label>Interval</label><input type="text" id="themeInterval" style="width:60px" placeholder="10"> seconds
+      <button id="themeAutoSaveBtn">Save</button>
+    </div>
+
+    <h2 class="section-title">Brightness</h2>
+    <div class="field-row">
+      <span>0</span><input type="range" id="brightness" min="-10" max="100" style="width:260px"><span>100</span>
+      <span class="hint" style="margin:0">saves on release</span>
+    </div>
+
+    <h2 class="section-title">Night Mode</h2>
+    <div class="field-row">
+      <label><input type="checkbox" id="nightEn"> Enable</label>
+    </div>
+    <div class="field-row">
+      <label>Start</label><select id="nightStart"></select>
+      <label>End</label><select id="nightEnd"></select>
+    </div>
+    <div class="field-row">
+      <label>Night Brightness</label>
+      <span>0</span><input type="range" id="nightBrightness" min="-10" max="100" style="width:200px"><span>100</span>
+    </div>
+    <div class="field-row">
+      <button id="nightSaveBtn">Save</button>
+    </div>
+
+    <h2 class="section-title">Device</h2>
+    <p id="deviceModel" class="hint">&nbsp;</p>
+    <div class="field-row">
+      <button id="rebootBtn" class="danger">Reboot</button>
+      <button id="resetBtn" class="danger">Factory Reset</button>
+    </div>
+    <p class="hint">Factory reset clears settings but keeps uploaded files.</p>
+
+    <h2 class="section-title">Firmware Update</h2>
+    <p class="hint warn"><strong>Check the product model before updating.</strong> The wrong firmware file can make the device unresponsive.</p>
+    <div class="field-row">
+      <input type="file" id="firmwareFile" accept=".bin,.bin.gz">
+      <button id="firmwareUploadBtn" class="danger">Update</button>
+    </div>
+  </div>
 </div>
 
 <footer class="colophon">
@@ -323,6 +633,16 @@ let curDir = '/image/';
 function setStatus(msg, isErr) {
   $('status').textContent = msg || '';
   $('status').style.color = isErr ? '#7d3644' : '#6b5d47';
+}
+
+let toastTimer = null;
+function toast(msg, ok) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.style.color = ok ? '#1f3327' : '#7d3644';
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
 }
 
 async function api(path, opts) {
@@ -536,7 +856,13 @@ async function upload(files) {
   list(curDir);
 }
 
-$('connectBtn').onclick = () => { localStorage.setItem('device', $('device').value.trim()); list('/image/'); };
+$('connectBtn').onclick = () => {
+  localStorage.setItem('device', $('device').value.trim());
+  tabLoaded = {};
+  list('/image/');
+  const active = document.querySelector('.tab-btn.active').dataset.tab;
+  if (active !== 'pictures') loadTab(active);
+};
 $('folderPreset').onchange = () => list($('folderPreset').value);
 $('refreshBtn').onclick = () => list(curDir);
 $('drop').onclick = () => $('fileInput').click();
@@ -548,6 +874,287 @@ $('drop').addEventListener('drop', e => {
   $('drop').classList.remove('over');
   upload(e.dataTransfer.files);
 });
+
+// --- Tabs: Network / Weather / Time / Settings -------------------------
+// Each tab's fields are only fetched the first time that tab is opened
+// (tabLoaded caches this), and only the device endpoints that tab actually
+// renders are requested — see the TAB_LOADERS comment in server.py for why
+// those are batched server-side into one call each instead of one fetch
+// per field.
+
+let tabLoaded = {};
+
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
+  loadTab(name);
+}
+document.querySelectorAll('.tab-btn').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+$('gotoGifFolder').onclick = (e) => {
+  e.preventDefault();
+  switchTab('pictures');
+  list('/gif/');
+};
+
+async function loadTab(name) {
+  if (tabLoaded[name] || name === 'pictures') return;
+  const loaders = { network: loadNetworkTab, weather: loadWeatherTab, time: loadTimeTab, settings: loadSettingsTab };
+  await loaders[name]();
+  tabLoaded[name] = true;
+}
+
+// A thin wrapper around the generic /api/set passthrough, used by nearly
+// every Save button below — written explicitly at each call site (rather
+// than derived from a {field: element} config table) so every field's
+// exact device parameter name stays visible and easy to check against the
+// device's own network.html/weather.html/time.html/settings.html source.
+async function saveSet(query, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api('/api/set?' + query);
+    const text = (await res.text()).trim();
+    toast(text === 'OK' ? 'Saved.' : 'Save failed.', text === 'OK');
+  } catch (e) {
+    toast('Save failed: ' + e.message, false);
+  }
+  if (btn) btn.disabled = false;
+}
+
+function buildUtcOffsetOptions() {
+  const sel = $('tzOffset');
+  for (let mins = -12 * 60; mins <= 14 * 60; mins += 15) {
+    const sign = mins >= 0 ? '+' : '-';
+    const abs = Math.abs(mins);
+    const h = Math.floor(abs / 60);
+    const m = String(abs % 60).padStart(2, '0');
+    const opt = document.createElement('option');
+    opt.value = mins;
+    opt.textContent = 'UTC' + sign + h + ':' + m;
+    sel.appendChild(opt);
+  }
+  sel.value = 480; // UTC+8, matches the device's own default
+}
+function buildHourOptions(sel, defaultVal) {
+  for (let h = 0; h < 24; h++) {
+    const opt = document.createElement('option');
+    opt.value = h;
+    opt.textContent = String(h).padStart(2, '0') + ':00';
+    sel.appendChild(opt);
+  }
+  sel.value = defaultVal;
+}
+buildUtcOffsetOptions();
+buildHourOptions($('nightStart'), 22);
+buildHourOptions($('nightEnd'), 7);
+
+// --- Network tab ---
+async function loadNetworkTab() {
+  try {
+    const res = await api('/api/tab/network');
+    const d = await res.json();
+    if (d.config && d.config.a) $('wifiSsid').value = d.config.a;
+    // Password is intentionally never prefilled (see hint text in the
+    // markup) — the device's own UI fills it with the literal masked
+    // string "****", which is a footgun if saved unedited.
+    if (d.delay && d.delay.delay !== undefined) $('wifiDelay').value = d.delay.delay;
+  } catch (e) {
+    toast('Failed to load network settings: ' + e.message, false);
+  }
+  loadWifiScan();
+}
+async function loadWifiScan() {
+  const sel = $('wifiSelect');
+  sel.disabled = true;
+  sel.innerHTML = '<option>Scanning&hellip;</option>';
+  try {
+    const res = await api('/api/wifiscan');
+    const d = await res.json();
+    sel.innerHTML = '<option value="">Select a network&hellip;</option>';
+    (d.aps || []).sort((a, b) => b.r - a.r).forEach(ap => {
+      const opt = document.createElement('option');
+      opt.value = ap.ss;
+      opt.textContent = ap.ss + ' (' + ap.r + '%)';
+      sel.appendChild(opt);
+    });
+  } catch (e) {
+    sel.innerHTML = '<option value="">Scan failed</option>';
+  }
+  sel.disabled = false;
+}
+$('wifiSelect').onchange = () => {
+  $('wifiSsid').value = $('wifiSelect').value;
+  $('wifiPwd').value = '';
+  $('wifiPwd').focus();
+};
+$('wifiRescanBtn').onclick = loadWifiScan;
+$('wifiSaveBtn').onclick = async () => {
+  const s = $('wifiSsid').value.trim();
+  if (!s) { toast('Enter a Wi-Fi name first.', false); return; }
+  $('wifiSaveBtn').disabled = true;
+  try {
+    await api('/api/wifisave?s=' + encodeURIComponent(s) + '&p=' + encodeURIComponent($('wifiPwd').value));
+    toast('Wi-Fi info saved — the device will try to reboot and reconnect.', true);
+  } catch (e) {
+    toast('Save failed: ' + e.message, false);
+  }
+  $('wifiSaveBtn').disabled = false;
+};
+$('wifiDelaySaveBtn').onclick = () => saveSet('delay=' + encodeURIComponent($('wifiDelay').value.trim()), $('wifiDelaySaveBtn'));
+
+// --- Weather tab ---
+async function loadWeatherTab() {
+  try {
+    const res = await api('/api/tab/weather');
+    const d = await res.json();
+    if (d.city && d.city.cd) $('weatherCity').value = d.city.cd;
+    if (d.unit) {
+      if (d.unit.w_u) $('weatherWindUnit').value = d.unit.w_u;
+      if (d.unit.t_u) $('weatherTempUnit').value = d.unit.t_u;
+      if (d.unit.p_u) $('weatherPressureUnit').value = d.unit.p_u;
+    }
+    if (d.w_i && d.w_i.w_i) $('weatherInterval').value = d.w_i.w_i;
+    if (d.key && d.key.key) $('weatherKey').value = d.key.key;
+    // No endpoint reads the forecast key back — the device's own UI
+    // doesn't fetch it either, so it stays a write-only field here too.
+  } catch (e) {
+    toast('Failed to load weather settings: ' + e.message, false);
+  }
+}
+$('weatherCitySaveBtn').onclick = () => {
+  const v = $('weatherCity').value.trim();
+  if (!v) { toast('City location cannot be empty.', false); return; }
+  saveSet('cd1=' + encodeURIComponent(v) + '&cd2=1000', $('weatherCitySaveBtn'));
+};
+$('weatherUnitSaveBtn').onclick = () => saveSet(
+  'w_u=' + encodeURIComponent($('weatherWindUnit').value) +
+  '&t_u=' + encodeURIComponent($('weatherTempUnit').value) +
+  '&p_u=' + encodeURIComponent($('weatherPressureUnit').value),
+  $('weatherUnitSaveBtn')
+);
+$('weatherIntervalSaveBtn').onclick = () => saveSet('w_i=' + encodeURIComponent($('weatherInterval').value.trim()), $('weatherIntervalSaveBtn'));
+$('weatherKeySaveBtn').onclick = () => saveSet('key=' + encodeURIComponent($('weatherKey').value.trim()), $('weatherKeySaveBtn'));
+$('weatherForecastKeySaveBtn').onclick = () => saveSet('fkey=' + encodeURIComponent($('weatherForecastKey').value.trim()), $('weatherForecastKeySaveBtn'));
+
+// --- Time tab ---
+async function loadTimeTab() {
+  try {
+    const res = await api('/api/tab/time');
+    const d = await res.json();
+    if (d.tz) {
+      if (d.tz.tz_auto !== undefined) $('tzMode').value = d.tz.tz_auto;
+      if (d.tz.tz_off !== undefined) $('tzOffset').value = d.tz.tz_off;
+    }
+    if (d.timecolor) {
+      if (d.timecolor.hc) $('timeHourColor').value = d.timecolor.hc;
+      if (d.timecolor.mc) $('timeMinColor').value = d.timecolor.mc;
+      if (d.timecolor.sc) $('timeSecColor').value = d.timecolor.sc;
+    }
+    if (d.hour12 && d.hour12.h == 1) $('time12h').checked = true;
+    if (d.day && d.day.day_fmt) $('dateFormat').value = d.day.day_fmt;
+    if (d.colon && d.colon.colon) $('colonBlink').checked = true;
+    if (d.font && d.font.font) $('timeFont').value = d.font.font;
+    if (d.ntp && d.ntp.ntp) $('ntpServer').value = d.ntp.ntp;
+  } catch (e) {
+    toast('Failed to load time settings: ' + e.message, false);
+  }
+}
+$('tzSaveBtn').onclick = () => saveSet('tz_auto=' + $('tzMode').value + '&tz_offset=' + $('tzOffset').value, $('tzSaveBtn'));
+$('timeColorSaveBtn').onclick = () => saveSet(
+  'hc=' + encodeURIComponent($('timeHourColor').value) +
+  '&mc=' + encodeURIComponent($('timeMinColor').value) +
+  '&sc=' + encodeURIComponent($('timeSecColor').value),
+  $('timeColorSaveBtn')
+);
+$('time12hSaveBtn').onclick = () => saveSet('hour=' + ($('time12h').checked ? 1 : 0), $('time12hSaveBtn'));
+$('dateFormat').onchange = () => saveSet('day=' + $('dateFormat').value, null);
+$('colonSaveBtn').onclick = () => saveSet('colon=' + ($('colonBlink').checked ? 1 : 0), $('colonSaveBtn'));
+$('timeFont').onchange = () => saveSet('font=' + $('timeFont').value, null);
+$('ntpSaveBtn').onclick = () => saveSet('ntp=' + encodeURIComponent($('ntpServer').value.trim()), $('ntpSaveBtn'));
+
+// --- Settings tab ---
+function highlightActiveTheme(n) {
+  document.querySelectorAll('[data-theme]').forEach(b => {
+    b.classList.toggle('active-theme', b.dataset.theme == n);
+  });
+}
+async function loadSettingsTab() {
+  try {
+    const res = await api('/api/tab/settings');
+    const d = await res.json();
+    if (d.v) $('deviceModel').textContent = 'Model: ' + d.v.m + ', Version: ' + d.v.v;
+    if (d.brt && d.brt.brt !== undefined) $('brightness').value = d.brt.brt;
+    if (d.app && d.app.theme) highlightActiveTheme(d.app.theme);
+    if (d.timebrt) {
+      if (d.timebrt.t1 !== undefined) $('nightStart').value = d.timebrt.t1;
+      if (d.timebrt.t2 !== undefined) $('nightEnd').value = d.timebrt.t2;
+      if (d.timebrt.en) $('nightEn').checked = true;
+      if (d.timebrt.b2 !== undefined) $('nightBrightness').value = d.timebrt.b2;
+    }
+    if (d.theme_list && d.theme_list.list) {
+      const list = d.theme_list.list;
+      // The device serializes this list as a raw comma-joined string and
+      // the JSON response re-splits it per character, so each theme's
+      // flag ends up at an EVEN index (the odd ones are "," separators).
+      // This mirrors the device's own settings.js parsing, not a bug here.
+      const idxs = [0, 2, 4, 6, 8, 10, 12];
+      document.querySelectorAll('.theme-check').forEach((cb, i) => {
+        cb.checked = list[idxs[i]] === '1';
+      });
+      if (d.theme_list.sw_en == 1) $('themeAutoEn').checked = true;
+      if (d.theme_list.sw_i) $('themeInterval').value = d.theme_list.sw_i;
+    }
+  } catch (e) {
+    toast('Failed to load device settings: ' + e.message, false);
+  }
+}
+document.querySelectorAll('[data-theme]').forEach(b => {
+  b.onclick = async () => { await saveSet('theme=' + b.dataset.theme, b); highlightActiveTheme(b.dataset.theme); };
+});
+$('themeAutoSaveBtn').onclick = () => {
+  const checks = document.querySelectorAll('.theme-check');
+  const enabled = $('themeAutoEn').checked;
+  if (enabled && Array.from(checks).filter(c => c.checked).length < 2) {
+    toast('Choose at least two themes to auto-switch between.', false);
+    return;
+  }
+  const arr = Array.from(checks).map(c => c.checked ? 1 : 0).join(',');
+  const q = 'theme_list=' + encodeURIComponent(arr) + '&sw_en=' + (enabled ? 1 : 0) +
+    '&theme_interval=' + encodeURIComponent($('themeInterval').value.trim());
+  saveSet(q, $('themeAutoSaveBtn'));
+};
+$('brightness').addEventListener('change', () => saveSet('brt=' + $('brightness').value, null));
+$('nightSaveBtn').onclick = () => {
+  const en = $('nightEn').checked ? 1 : 0;
+  saveSet('t1=' + $('nightStart').value + '&t2=' + $('nightEnd').value + '&b1=50&b2=' + $('nightBrightness').value + '&en=' + en, $('nightSaveBtn'));
+};
+
+// Reboot, factory reset, and firmware update all have real, hard-to-undo
+// effects on the device, so each is gated behind its own confirm() (same
+// as the device's own settings.html) and none of them were exercised while
+// building this — they're wired up to match the official /set?reboot=1,
+// /set?reset=1 and POST /update calls exactly, but verify them for real
+// the first time you use them.
+$('rebootBtn').onclick = () => {
+  if (confirm('Reboot the device?')) saveSet('reboot=1', $('rebootBtn'));
+};
+$('resetBtn').onclick = () => {
+  if (confirm('Factory reset will erase all settings (uploaded files are kept). Continue?')) saveSet('reset=1', $('resetBtn'));
+};
+$('firmwareUploadBtn').onclick = async () => {
+  const f = $('firmwareFile').files[0];
+  if (!f) { toast('Choose a firmware file first.', false); return; }
+  if (!confirm('Flashing the wrong firmware can make the device unresponsive. Continue?')) return;
+  const fd = new FormData();
+  fd.append('firmware', f);
+  $('firmwareUploadBtn').disabled = true;
+  try {
+    await api('/api/firmware', { method: 'POST', body: fd });
+    toast('Firmware uploaded — the device will reboot.', true);
+  } catch (e) {
+    toast('Upload failed: ' + e.message, false);
+  }
+  $('firmwareUploadBtn').disabled = false;
+};
 
 list('/image/');
 </script>
@@ -565,6 +1172,13 @@ class Handler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(parsed.query)
         device = qs.get("device", [DEFAULT_DEVICE])[0]
         return parsed, qs, device
+
+    def _query_minus_device(self, parsed):
+        # Strips our own device= param and forwards everything else to the
+        # device verbatim (no decode/re-encode round trip), for endpoints
+        # that are thin passthroughs of the device's own query string.
+        pairs = [p for p in parsed.query.split("&") if not p.startswith("device=")]
+        return "&".join(pairs)
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj).encode()
@@ -665,6 +1279,55 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             return
 
+        if parsed.path.startswith("/api/tab/"):
+            loader = TAB_LOADERS.get(parsed.path[len("/api/tab/"):])
+            if loader is None:
+                self._send_bytes(b"Not found", status=404)
+                return
+            self._send_json(loader(device))
+            return
+
+        if parsed.path == "/api/set":
+            # A thin passthrough to the device's own /set endpoint, which
+            # already multiplexes every writable field (theme, brightness,
+            # night mode, timezone, clock colors, wifi delay, reboot,
+            # reset, ...) behind one query string — see network.html,
+            # weather.html, time.html and settings.html on the device
+            # itself, which all funnel their "SAVE" buttons through the
+            # same /set?param=value calls this forwards verbatim. No need
+            # for a dedicated handler per field.
+            try:
+                status, _, body = device_request(
+                    device, "/set?" + self._query_minus_device(parsed)
+                )
+                self._send_bytes(body, status=status)
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=502)
+            return
+
+        if parsed.path == "/api/wifiscan":
+            try:
+                # A WiFi scan takes longer than the device's other tiny
+                # JSON endpoints, so this gets a longer timeout than the
+                # 10s default.
+                status, _, body = device_request(
+                    device, "/wifi.json?q=1", timeout=20
+                )
+                self._send_bytes(body, content_type="application/json")
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=502)
+            return
+
+        if parsed.path == "/api/wifisave":
+            try:
+                status, _, body = device_request(
+                    device, "/wifisave?" + self._query_minus_device(parsed)
+                )
+                self._send_bytes(body, status=status)
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=502)
+            return
+
         self._send_bytes(b"Not found", status=404)
 
     def do_POST(self):
@@ -726,6 +1389,27 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass  # renamed copy exists regardless; the old one just lingers
             self._send_json({"ok": True})
+            return
+
+        if parsed.path == "/api/firmware":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            ctype = self.headers.get("Content-Type", "")
+            try:
+                # Firmware images are much larger than anything else this
+                # proxies, and flashing itself takes time on the device
+                # side too, so this gets a generous timeout.
+                status, _, resp_body = device_request(
+                    device,
+                    "/update",
+                    method="POST",
+                    data=body,
+                    headers={"Content-Type": ctype, "Content-Length": str(len(body))},
+                    timeout=90,
+                )
+                self._send_bytes(resp_body, status=status)
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=502)
             return
 
         self._send_bytes(b"Not found", status=404)
