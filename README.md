@@ -49,3 +49,7 @@ Python 3 is the only requirement (standard library only), except that video conv
 Developed against a single device (firmware `Ultra-V9.0.51`). This is an unofficial project and is not affiliated with GeekMagic.
 
 Reboot, factory reset, saving Wi-Fi credentials and firmware update are wired to send the same requests as the official page, but have not been exercised against a real device. Treat them with care.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
