@@ -1,6 +1,6 @@
 # SmallTVUI
 
-A local web UI for managing the files on a GeekMagic SmallTV-Ultra, a small ESP8266-based Wi-Fi display.
+A local web UI for managing the files on a GeekMagic SmallTV-Ultra, a small ESP8266-based Wi-Fi display: browse, preview, rename, upload and delete what's stored on it.
 
 ## How it works
 
@@ -12,6 +12,10 @@ The device sends no CORS headers, so a web page can't call it from another origi
 
 - Browse the device's picture and weather-GIF folders; upload (drag and drop or file picker), download and delete files
 - Free-space readout
+- Image preview, streamed from the device with a live progress bar
+- Resolution column, read from the first few KB of each image and cached
+- Rename. The device has no rename endpoint, so this copies the file under the new name and only then deletes the original; a failure partway never loses data
+- Storage meter that turns red as the device fills up
 
 ## Running
 
@@ -27,6 +31,8 @@ Python 3 is the only requirement (standard library only).
 
 - Listing a folder without a `dir` parameter returns links that are missing the folder prefix (they 404), so `dir` is always passed explicitly.
 - `/delete` replies with the text "Fail" even when the file was removed, so the HTTP status is trusted instead of the body.
+- The device ignores `Range` and serves files slowly (a few hundred KB can take 10 to 20 seconds). Reading just the first bytes of a response and closing the connection is near-instant, which is how image resolutions are read.
+- It drops requests when connections overlap, so anything that touches several files runs sequentially.
 
 ## Status
 
