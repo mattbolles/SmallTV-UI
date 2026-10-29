@@ -24,6 +24,16 @@ The device sends no CORS headers, so a web page can't call it from another origi
 - Upload progress bar, measured on the proxy-to-device leg where the time is actually spent
 - Uploaded filenames are sanitized (see below)
 
+## Screenshots
+
+Captured against a mock device serving generated sample images.
+
+![Pictures tab: file list with resolutions, storage meter and an inline preview](docs/screenshots/pictures.png)
+
+![Video to GIF converter: trim, zoom, convert and upload](docs/screenshots/video-to-gif.png)
+
+![Settings tab: themes, brightness and night mode](docs/screenshots/settings.png)
+
 ## Running
 
 ```
