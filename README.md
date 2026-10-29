@@ -21,6 +21,8 @@ The device sends no CORS headers, so a web page can't call it from another origi
 - Video to GIF: drop in a clip, trim it, zoom and drag it inside a square preview of the 240x240 screen (zooming out pads with black), then convert with ffmpeg and upload the result
 - Size controls for a device with very little free flash: frame rate, palette size (8 to 256 colors), dithering and an option that only re-encodes the parts of each frame that change
 - Shows the source video's resolution, length and frame rate
+- Upload progress bar, measured on the proxy-to-device leg where the time is actually spent
+- Uploaded filenames are sanitized (see below)
 
 ## Running
 
@@ -40,6 +42,7 @@ Python 3 is the only requirement (standard library only), except that video conv
 - It drops requests when connections overlap, so anything that touches several files runs sequentially.
 - Settings that were never saved return 404 rather than a default, which is treated as "leave the field at its default".
 - The official page pre-fills the Wi-Fi password field with the masked value `****`, which would overwrite the real password if saved unedited. This UI always leaves that field blank.
+- A file whose name contains a space is listed as 0 KB (the file itself is intact), so uploads are restricted to letters, digits, underscores and hyphens.
 
 ## Status
 

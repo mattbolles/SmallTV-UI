@@ -3,12 +3,14 @@
 generic file endpoints, so arbitrary files can be listed/uploaded/downloaded/
 deleted over WiFi without touching the device firmware.
 """
+import http.client
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -44,6 +46,52 @@ def device_request(device, path, method="GET", data=None, headers=None, timeout=
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status, dict(resp.getheaders()), resp.read()
+
+
+# Tracks in-flight uploads to the device by a client-generated id, so the
+# browser can poll /api/upload-progress while the (slow, potentially
+# 10s+) upload to the device is happening in the request thread that owns
+# it. Guarded by a lock since it's read from one thread (the poller) and
+# written from another (the uploader) concurrently.
+_upload_progress = {}
+_upload_progress_lock = threading.Lock()
+
+
+def device_upload_stream(device, path, body, content_type, upload_id=None, timeout=60, chunk_size=4096):
+    # Sends the body to the device in small chunks (rather than handing it
+    # to urllib.request as one blob) purely so upload_id's progress entry
+    # can be updated as it goes — the device itself sees the same bytes
+    # either way. This is what actually makes a progress bar meaningful:
+    # the slow leg is this proxy talking to the device, not the browser's
+    # upload to the proxy (which is over localhost and effectively
+    # instant), so progress has to be measured here, not client-side.
+    total = len(body)
+    if upload_id:
+        with _upload_progress_lock:
+            _upload_progress[upload_id] = {"sent": 0, "total": total}
+    conn = http.client.HTTPConnection(device, timeout=timeout)
+    try:
+        conn.putrequest("POST", path)
+        conn.putheader("Content-Type", content_type)
+        conn.putheader("Content-Length", str(total))
+        conn.endheaders()
+        sent = 0
+        for i in range(0, total, chunk_size):
+            chunk = body[i:i + chunk_size]
+            conn.send(chunk)
+            sent += len(chunk)
+            if upload_id:
+                with _upload_progress_lock:
+                    _upload_progress[upload_id]["sent"] = sent
+        resp = conn.getresponse()
+        status = resp.status
+        resp_body = resp.read()
+    finally:
+        conn.close()
+        if upload_id:
+            with _upload_progress_lock:
+                _upload_progress.pop(upload_id, None)
+    return status, resp_body
 
 
 class FfmpegNotFound(Exception):
@@ -501,8 +549,20 @@ INDEX_HTML = """<!doctype html>
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
 
-  /* --- Save toast --- */
-  .toast { min-height: 18px; text-align: center; font-size: 13px; font-style: italic; margin-bottom: 8px; opacity: 0; transition: opacity 0.3s ease; }
+  /* --- Save toast ---
+     Fixed rather than inline: this used to sit in normal flow right under
+     the header, which meant it was invisible (scrolled off-screen) for
+     any action taken further down the page — including, notably, the
+     video-to-GIF "Upload to Device" button. Floating it means every
+     action's confirmation is visible no matter how far you've scrolled. */
+  .toast {
+    position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+    z-index: 1000; max-width: 90%; text-align: center;
+    font-size: 13px; font-style: italic; padding: 10px 18px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    box-shadow: 0 2px 10px rgba(43,33,23,0.25);
+    opacity: 0; pointer-events: none; transition: opacity 0.3s ease;
+  }
   .toast.show { opacity: 1; }
 
   /* --- Form sections shared by Network / Weather / Time / Settings tabs --- */
@@ -672,6 +732,11 @@ INDEX_HTML = """<!doctype html>
             <option value="/gif/">Weather GIF</option>
           </select>
           <button id="v2gUploadBtn" class="primary">Upload to Device</button>
+        </div>
+        <div id="v2gUploadProgress" class="loader" style="display:none">
+          <div class="spinner"></div>
+          <div id="v2gUploadProgText" class="prog-text">Uploading&hellip;</div>
+          <div class="prog-bar-outer"><div id="v2gUploadProgBar" class="prog-bar-inner"></div></div>
         </div>
       </div>
     </div>
@@ -906,6 +971,54 @@ async function api(path, opts) {
   return res;
 }
 
+function sanitizeFilename(name) {
+  // The device's own file-listing firmware has at least one confirmed bug
+  // triggered by unusual filenames (a space in one name caused that file's
+  // real size to be misreported as 0 in the listing, even though the file
+  // itself was intact) — so every upload path funnels through here rather
+  // than trusting arbitrary names, keeping filenames to a conservative
+  // alphanumeric/underscore/hyphen set to avoid tripping similar bugs.
+  const dot = name.lastIndexOf('.');
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '';
+  const cleanBase = base.replace(/\\s+/g, '_').replace(/[^A-Za-z0-9_\\-]/g, '_');
+  return (cleanBase || 'file') + ext;
+}
+
+// The actual slow leg of an upload is this proxy relaying bytes to the
+// device (see device_upload_stream in server.py), not the browser's own
+// upload to the proxy over localhost — so progress has to come from
+// polling the server's view of that, not from XHR upload events, which
+// would just show the (near-instant) local leg finishing immediately.
+async function uploadFileWithProgress(dir, blob, filename, onProgress) {
+  const uploadId = Date.now() + '-' + Math.random().toString(36).slice(2);
+  const device = $('device').value.trim();
+  const fd = new FormData();
+  fd.append('image', blob, filename);
+
+  let polling = true;
+  (async () => {
+    while (polling) {
+      try {
+        const res = await fetch('/api/upload-progress?id=' + uploadId);
+        const j = await res.json();
+        if (j.total > 0 && onProgress) onProgress(j.sent, j.total);
+      } catch (e) { /* keep polling; a missed tick isn't worth surfacing */ }
+      await new Promise(r => setTimeout(r, 250));
+    }
+  })();
+
+  try {
+    const url = '/api/upload?dir=' + encodeURIComponent(dir) +
+      '&uploadId=' + uploadId + '&device=' + encodeURIComponent(device);
+    const res = await fetch(url, { method: 'POST', body: fd });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return await res.text();
+  } finally {
+    polling = false;
+  }
+}
+
 async function refreshSpace() {
   try {
     const res = await api('/api/space');
@@ -1070,7 +1183,7 @@ async function renameFile(f, existingNames, btn) {
   if (newBase === null) return;
   const trimmed = newBase.trim();
   if (!trimmed || trimmed === base) return;
-  const newName = trimmed + ext;
+  const newName = sanitizeFilename(trimmed + ext);
   if (newName !== f.name && existingNames.includes(newName)) {
     if (!confirm('A file named "' + newName + '" already exists here. Overwrite it?')) return;
   }
@@ -1096,14 +1209,15 @@ async function renameFile(f, existingNames, btn) {
 
 async function upload(files) {
   for (const file of files) {
-    setStatus('Uploading ' + file.name + ' ...');
-    const fd = new FormData();
-    fd.append('image', file, file.name);
+    const name = sanitizeFilename(file.name);
+    setStatus('Uploading ' + name + ' ...');
     try {
-      await api('/api/upload?dir=' + encodeURIComponent(curDir), { method: 'POST', body: fd });
-      setStatus('Uploaded ' + file.name);
+      await uploadFileWithProgress(curDir, file, name, (sent, total) => {
+        setStatus('Uploading ' + name + ' ... ' + Math.round((sent / total) * 100) + '%');
+      });
+      setStatus('Uploaded ' + name);
     } catch (e) {
-      setStatus('Upload failed for ' + file.name + ': ' + e.message, true);
+      setStatus('Upload failed for ' + name + ': ' + e.message, true);
     }
   }
   list(curDir);
@@ -1336,7 +1450,7 @@ $('v2gConvertBtn').onclick = async () => {
     v2gResultBlob = blob;
     $('v2gResultImg').src = URL.createObjectURL(blob);
     $('v2gResultInfo').textContent = 'Result: ' + Math.round(blob.size / 1024) + 'KB';
-    $('v2gFilename').value = (v2gFile.name || 'clip').replace(/\\.[^.]+$/, '') + '.gif';
+    $('v2gFilename').value = sanitizeFilename((v2gFile.name || 'clip').replace(/\\.[^.]+$/, '') + '.gif');
     $('v2gUploadDir').value = $('v2gSize').value === '80' ? '/gif/' : '/image/';
     $('v2gResult').style.display = 'block';
   } catch (e) {
@@ -1348,18 +1462,24 @@ $('v2gConvertBtn').onclick = async () => {
 
 $('v2gUploadBtn').onclick = async () => {
   if (!v2gResultBlob) return;
-  const name = $('v2gFilename').value.trim() || 'clip.gif';
+  const name = sanitizeFilename($('v2gFilename').value.trim() || 'clip.gif');
   const dir = $('v2gUploadDir').value;
   $('v2gUploadBtn').disabled = true;
+  $('v2gUploadProgress').style.display = 'flex';
+  $('v2gUploadProgText').textContent = 'Uploading…';
+  $('v2gUploadProgBar').style.width = '0%';
   try {
-    const fd = new FormData();
-    fd.append('image', v2gResultBlob, name);
-    await api('/api/upload?dir=' + encodeURIComponent(dir), { method: 'POST', body: fd });
+    await uploadFileWithProgress(dir, v2gResultBlob, name, (sent, total) => {
+      const pct = Math.round((sent / total) * 100);
+      $('v2gUploadProgText').textContent = 'Uploading… ' + pct + '%';
+      $('v2gUploadProgBar').style.width = pct + '%';
+    });
     toast('Uploaded ' + name + ' to ' + dir, true);
     if (curDir === dir) list(dir);
   } catch (e) {
     toast('Upload failed: ' + e.message, false);
   }
+  $('v2gUploadProgress').style.display = 'none';
   $('v2gUploadBtn').disabled = false;
 };
 
@@ -1745,6 +1865,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, status=502)
             return
 
+        if parsed.path == "/api/upload-progress":
+            upload_id = qs.get("id", [None])[0]
+            with _upload_progress_lock:
+                info = _upload_progress.get(upload_id, {"sent": 0, "total": 0})
+            self._send_json(info)
+            return
+
         if parsed.path == "/api/delete":
             f = qs.get("file", [""])[0]
             try:
@@ -1822,19 +1949,23 @@ class Handler(BaseHTTPRequestHandler):
         parsed, qs, device = self._device_and_query()
         if parsed.path == "/api/upload":
             d = qs.get("dir", ["/"])[0]
+            upload_id = qs.get("uploadId", [None])[0]
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             ctype = self.headers.get("Content-Type", "")
             try:
-                status, _, resp_body = device_request(
+                status, resp_body = device_upload_stream(
                     device,
                     "/doUpload?dir=" + urllib.parse.quote(d, safe="/"),
-                    method="POST",
-                    data=body,
-                    headers={"Content-Type": ctype, "Content-Length": str(len(body))},
+                    body,
+                    ctype,
+                    upload_id=upload_id,
                 )
                 self._send_bytes(resp_body, status=status)
             except Exception as e:
+                if upload_id:
+                    with _upload_progress_lock:
+                        _upload_progress.pop(upload_id, None)
                 self._send_json({"error": str(e)}, status=502)
             return
 
